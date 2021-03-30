@@ -16,9 +16,9 @@ echo "https://github.com/wang-bin/avbuild"
 
 THIS_NAME=${0##*/}
 THIS_DIR=$PWD
-PLATFORMS="ios|android|rpi|sunxi|vc|win|winrt|uwp|winphone|mingw"
+PLATFORMS="ios|iossimulator|android|rpi|sunxi|vc|win|winrt|uwp|winphone|mingw"
 echo "Usage:"
-test -d $PWD/ffmpeg || echo "  export FFSRC=/path/to/ffmpeg"
+test -d $PWD/FFmpeg || echo "  export FFSRC=/path/to/ffmpeg"
 cat<<HELP
 ./$THIS_NAME [target_platform [target_architecture[-clang*/gcc*]]]
 target_platform can be: ${PLATFORMS}
@@ -41,7 +41,7 @@ test -f $USER_CONFIG &&  . $USER_CONFIG
 #: ${FEATURE_OPT:="--enable-hwaccels"}
 : ${DEBUG_OPT:="--disable-debug"}
 : ${FORCE_LTO:=false}
-: ${FFSRC:=$PWD/ffmpeg}
+: ${FFSRC:=$PWD/FFmpeg}
 [[ "$LIB_OPT" == *"--disable-static"* ]] && FORCE_LTO=true
 # other env vars to control build: NO_ENC, BITCODE, WINPHONE, VC_BUILD, FORCE_LTO (bool)
 
@@ -139,6 +139,32 @@ android_arch(){
   echo ${arch:=$1}
 }
 
+linux_arch(){
+  if [[ "$ARCH" == *ar*64 ]]; then
+    echo arm64
+  elif [[ "$ARCH" == *64 ]]; then
+    echo amd64
+  elif [[ "$ARCH" == *86 ]]; then
+    echo i386
+  elif [[ "$ARCH" == armel ]]; then
+    echo armel
+  elif [[ "$ARCH" == arm* ]]; then
+    echo armhf
+  fi
+}
+
+linux_gnu_triple(){
+  if [[ "$ARCH" == *ar*64 ]]; then
+    echo aarch64-linux-gnu
+  elif [[ "$ARCH" == *64 ]]; then
+    echo x86_64-linux-gnu
+  elif [[ "$ARCH" == *86 ]]; then
+    echo i386-linux-gnu
+  elif [[ "$ARCH" == arm* ]]; then
+    echo arm-linux-gnueabihf
+  fi
+}
+
 enable_cuda_llvm() {
   grep -q "\-\-nvcc=" $FFSRC/configure && TOOLCHAIN_OPT+=" --nvcc=$USE_TOOLCHAIN"
 }
@@ -201,6 +227,9 @@ if [ -f "$PWD/tools/nv-codec-headers/ffnvcodec.pc.in" ]; then
   # cuGLGetDevices is a cuda8 api, never used
   sed -i $sed_bak 's/LOAD_SYMBOL(cuGLGetDevices\(.*\)/LOAD_SYMBOL_OPT(cuGLGetDevices\1/;s/LOAD_SYMBOL(cuDeviceGetAttribute\(.*\)/LOAD_SYMBOL_OPT(cuDeviceGetAttribute\1/;s/LOAD_SYMBOL(cuCtxSetLimit\(.*\)/LOAD_SYMBOL_OPT(cuCtxSetLimit\1/' tools/nv-codec-headers/include/ffnvcodec/dynlink_loader.h
 fi
+ls "$PWD/tools/nv-codec-headers"
+sed -i $sed_bak 's/-lmfplat/-lMfplat/g' "$FFSRC/configure"
+sed -i $sed_bak '/check_cflags -Werror=partial-availability/d' "$FFSRC/configure" # for SSL, VT
 
 use_clang() {
   if [ -n "$CROSS_PREFIX" ]; then # TODO: "$CROSS_PREFIX" != $TARGET_TRIPLE
@@ -242,7 +271,7 @@ setup_cc() {
 }
 
 to_unix_path() {
-  which wslpath &>/dev/null && { #append /mnt/ to the first path only
+  which wslpath &>/dev/null && { #preppend /mnt/ to the first path only. and always preppend /mnt/x before absolute path
     wslpath -u "$1" | sed 's,\;,\;/mnt\/,g;s,:,,g'
     exit 0
   }
@@ -256,11 +285,12 @@ use_llvm_binutils() {
   local clang_dir=${USE_TOOLCHAIN%clang*}
   local clang_name=${USE_TOOLCHAIN##*/}
   local clang=$clang_dir${clang_name/-cl/}
-  local CLANG_FALLBACK=clang-9
+  local CLANG_FALLBACK=clang-10
   $IS_APPLE_CLANG && CLANG_FALLBACK=/usr/local/opt/llvm/bin/clang
   echo "clang: `$clang --version`"
   # -print-prog-name= prints native dir format(on windows) and `which` fails
-  $(to_unix_path "`$clang -print-prog-name=llvm-ar`") --version &>/dev/null || clang=$CLANG_FALLBACK
+  `$clang -print-prog-name=llvm-ar` --version &>/dev/null || $(to_unix_path "`$clang -print-prog-name=llvm-ar`") --version &>/dev/null || clang=$CLANG_FALLBACK
+  echo clang=$clang
   for tool in ar nm ranlib; do # strip
     local tool_path=`eval 'which ${LLVM_'$(toupper $tool)'}'`
     local tool_path_print=$($clang -print-prog-name=llvm-$tool)
@@ -347,9 +377,21 @@ setup_win(){
   WIN_VER=`printf "0x%02X%02X" $os_major $os_minor`
   echo WIN_VER_SET: $WIN_VER_SET  WIN_VER:$WIN_VER
   local win_cc=clang
-  which cl.exe &>/dev/null && win_cc=cl.exe # .exe: for wsl
+  cl.exe
+  which cl.exe &>/dev/null && {
+    win_cc=cl.exe # .exe: for wsl
+  } || {
+    : ${Platform:=x86} #Platform is empty(native) or x86(cross using 64bit toolchain)
+    Platform=${arch:-${Platform}} # arch is set, but may be null,  so :-
+    local platform=$(tolower $Platform)
+    local PATH_arch=PATH_$platform
+    PATH_arch=${!PATH_arch}
+    PATH_arch=$(to_unix_path "$PATH_arch" |sed 's/\([a-zA-Z]\):/\/\1/g;s/\;/:/g;s/(/\\\(/g;s/)/\\\)/g;s/ /\\ /g')
+    PATH=$PATH_arch:$PATH which cl.exe &>/dev/null && win_cc=cl.exe
+  }
   : ${USE_TOOLCHAIN:=$win_cc}
   probe_cc $USE_TOOLCHAIN
+  enable_opt mediafoundation
   if $IS_CLANG ; then
     setup_win_clang $@
   else
@@ -428,24 +470,16 @@ setup_win_clang(){
   }
   TOOLCHAIN_OPT+=" --enable-cross-compile --arch=$arch $ASM_OPT --target-os=win32 --disable-stripping"
   [ -n "$WIN_VER_LD" ] && TOOLCHAIN_OPT+=" --extra-ldexeflags='-SUBSYSTEM:CONSOLE,$WIN_VER_LD'"
-  #FIXME: clang-cl undefined __stack_chk_guard for arm
-  # -fcf-protection[=full] x86 only?
-  # arm64 -Oz: .seh_ directive must appear within an active frame
-  $IS_CLANG_CL && {
-    EXTRA_CFLAGS+=" -MD /guard:cf"
-  } || {
-    EXTRA_CFLAGS+=" -Xclang -cfguard"    
-  }
   EXTRA_CFLAGS+=" $LTO_CFLAGS $TARGET_OPT -DWIN32 -D_WIN32 -D_WIN32_WINNT=$WIN_VER -Wno-nonportable-include-path -Wno-deprecated-declarations" # -Wno-deprecated-declarations: avoid clang crash
   $FORCE_LTO || $enable_lto && EXTRA_LDFLAGS+=" -MACHINE:$MACHINE" # lto is compiled as ir but not coff object and lld can not determin thw target arch
-  EXTRA_LDFLAGS+=' -OPT:REF -SUBSYSTEM:CONSOLE -NODEFAULTLIB:libcmt -DEFAULTLIB:msvcrt'
+  EXTRA_LDFLAGS+=' -DEBUG -OPT:REF -SUBSYSTEM:CONSOLE -NODEFAULTLIB:libcmt -DEFAULTLIB:msvcrt'
   EXTRALIBS+=" oldnames.lib" # fdopen, tempnam, close used in file_open.c
   INSTALL_DIR="sdk-$2-$Platform-clang"
   # pkgconf: check_func_headers() includes lflags "mfx.lib" which can not be in -c. fallbck to header and lib check.
   [ -n "$PKG_CONFIG_PATH_MFX" ] && PKG_CONFIG_PATH_MFX_UNIX=`to_unix_path "$PKG_CONFIG_PATH_MFX"`
   [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] || PKG_CONFIG_PATH_MFX_UNIX=${PKG_CONFIG_PATH_MFX_UNIX/\/lib\/pkgconfig/$Platform\/lib\/pkgconfig}
-  export PKG_CONFIG_PATH_MFX=$PKG_CONFIG_PATH_MFX_UNIX
-  [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] && export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$PKG_CONFIG_PATH_MFX_UNIX"
+  PKG_CONFIG_PATH_MFX=$PKG_CONFIG_PATH_MFX_UNIX
+  [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] && PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$PKG_CONFIG_PATH_MFX_UNIX"
 echo PKG_CONFIG_PATH_MFX_UNIX=$PKG_CONFIG_PATH_MFX_UNIX PKG_CONFIG_PATH_MFX=$PKG_CONFIG_PATH_MFX
   enable_libmfx
 
@@ -453,15 +487,30 @@ echo PKG_CONFIG_PATH_MFX_UNIX=$PKG_CONFIG_PATH_MFX_UNIX PKG_CONFIG_PATH_MFX=$PKG
   echo "CASE SENSITIVE FS!!!!!!!"
     [ -f "$WindowsSdkDir/vfs.yaml" ] && EXTRA_CFLAGS+=" -Xclang -ivfsoverlay -Xclang \\\"\$WindowsSdkDir/vfs.yaml\\\""
   }
+  cfguard=true
   # vcrt and win sdk dirs
   win10inc=(shared ucrt um winrt)
   win10inc=(${win10inc[@]/#/$WindowsSdkDir/Include/$WindowsSDKVersion/})
   IFS=\; eval 'INCLUDE="${win10inc[*]}"'
   local VCDIR_LIB=$VCDIR/lib/$ONECORE/${MACHINE/86_/}/$STORE
   ARCH120=${MACHINE/*86_*/amd64} #vc120 sdk layout
-  ARCH120=${MACHINE/x64/amd64}
-  ARCH120=${MACHINE/x86/}
-  [ ! -d "$VCDIR_LIB" ] && VCDIR_LIB=$VCDIR/lib/$STORE/${ARCH120}
+  ARCH120=${ARCH120/x64/amd64}
+  ARCH120=${ARCH120/x86/}
+  [ ! -d "$VCDIR_LIB" ] && {
+    VCDIR_LIB=$VCDIR/lib/$STORE/${ARCH120}
+    cfguard=false # since vs2015. undefined ___guard_check_icall_fptr
+    cp -af patches/0001-define-timespec-for-vcrt-140.patch "$FFSRC/tmp.patch"
+    (cd "$FFSRC" && patch -p1 -N <"tmp.patch")
+  }
+  $IS_CLANG_CL && {
+	EXTRA_CFLAGS+=" -MD"
+	[ "$MACHINE" == arm ] || EXTRA_CFLAGS+=" -Zi" # codeview is not implemented for arm(clang-10)
+	$cfguard && EXTRA_CFLAGS+=" /guard:cf"
+  }	|| {
+	[ "$MACHINE" == arm ] || EXTRA_CFLAGS+=" -g -gcodeview"
+	$cfguard && EXTRA_CFLAGS+=" -Xclang -cfguard"
+  }
+  $cfguard && EXTRA_LDFLAGS+=' -guard:cf'
   mkdir -p $THIS_DIR/build_$INSTALL_DIR
   cat > "$THIS_DIR/build_$INSTALL_DIR/.env.sh" <<EOF
 export INCLUDE="$VCDIR/include;$INCLUDE;$PKG_CONFIG_PATH_MFX_UNIX/../../include"
@@ -469,12 +518,8 @@ export LIB="$VCDIR_LIB;$WindowsSdkDir/Lib/$WindowsSDKVersion/ucrt/${MACHINE/86_/
 export AR=$LLVM_AR
 export NM=$LLVM_NM
 #export V=1 # FFmpeg BUG: AR is overriden in common.mak and becomes an invalid command in makedef(@printf works in makefiles but not sh scripts)
-EOF
-  if [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ]; then
-    cat >> "$THIS_DIR/build_$INSTALL_DIR/.env.sh" <<EOF
 export PKG_CONFIG_PATH=$PKG_CONFIG_PATH
 EOF
-  fi
 # [ expr1 ] && ... at end returns error if expr1 is false
 }
 
@@ -483,12 +528,13 @@ setup_vc_env() {
   local osver=$2
   grep -q "guard:cf is not recognized by armasm" "$FFSRC/configure" || sed -i $sed_bak "/-M\[TD\]\*)/a\\
 \            -guard*)                                            ;; # -guard:cf is not recognized by armasm\\
+\            -FS)                                                ;; # -FS is not recognized by armasm\\
 " "$FFSRC/configure"
   echo Call "set MSYS2_PATH_TYPE=inherit" before msys2 sh.exe if cl.exe is not found!
   enable_lto=false # ffmpeg requires DCE, while vc with LTCG (-GL) does not support DCE
   # dylink crt
-  EXTRA_CFLAGS+=" -MD -guard:cf"
-  EXTRA_LDFLAGS+=" -OPT:REF -SUBSYSTEM:CONSOLE -NODEFAULTLIB:libcmt" #-NODEFAULTLIB:libcmt -winmd?
+  EXTRA_CFLAGS+=" -Zi -FS -MD -guard:cf" # /Zi: https://scc.ustc.edu.cn/zlsc/tc4600/intel/2017.0.098/compiler_f/common/core/GUID-CA811CC8-A2C1-4DFF-AC39-DF7E1EEAF30E.html
+  EXTRA_LDFLAGS+=" -DEBUG -guard:cf -OPT:REF -SUBSYSTEM:CONSOLE -NODEFAULTLIB:libcmt" #-NODEFAULTLIB:libcmt -winmd?
   TOOLCHAIN_OPT+=" --toolchain=msvc"
   VS_VER=${VisualStudioVersion:0:2}
   : ${Platform:=x86} #Platform is empty(native) or x86(cross using 64bit toolchain)
@@ -498,8 +544,8 @@ setup_vc_env() {
 
   [ -n "$PKG_CONFIG_PATH_MFX" ] && PKG_CONFIG_PATH_MFX_UNIX=$(to_unix_path "$PKG_CONFIG_PATH_MFX")
   [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] || PKG_CONFIG_PATH_MFX_UNIX=${PKG_CONFIG_PATH_MFX_UNIX/\/lib\/pkgconfig/$Platform\/lib\/pkgconfig}
-  export PKG_CONFIG_PATH_MFX=$PKG_CONFIG_PATH_MFX_UNIX
-  [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] && export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$PKG_CONFIG_PATH_MFX_UNIX"
+  PKG_CONFIG_PATH_MFX=$PKG_CONFIG_PATH_MFX_UNIX
+  [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] && PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$PKG_CONFIG_PATH_MFX_UNIX"
   FAMILY=
   if ${WINRT:-false}; then
     [ -z "$osver" ] && osver=winrt
@@ -534,7 +580,7 @@ setup_vc_env() {
   [ -n "$LIB_arch" ] && echo "export LIB=$LIB_arch" >>"$THIS_DIR/build_$INSTALL_DIR/.env.sh"
   [ -n "$LIBPATH_arch" ] && echo "export LIBPATH=$LIBPATH_arch" >>"$THIS_DIR/build_$INSTALL_DIR/.env.sh"
   [ -n "$INCLUDE_arch" ] && echo "export INCLUDE=$INCLUDE_arch" >>"$THIS_DIR/build_$INSTALL_DIR/.env.sh"
-  [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] && cat >> "$THIS_DIR/build_$INSTALL_DIR/.env.sh" <<EOF
+  cat >> "$THIS_DIR/build_$INSTALL_DIR/.env.sh" <<EOF
 export PKG_CONFIG_PATH=$PKG_CONFIG_PATH
 EOF
 }
@@ -672,11 +718,12 @@ setup_mingw_env() {
   }
   [ -n "$PKG_CONFIG_PATH_MFX" ] && PKG_CONFIG_PATH_MFX_UNIX=$(to_unix_path "$PKG_CONFIG_PATH_MFX")
   [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] || PKG_CONFIG_PATH_MFX_UNIX=${PKG_CONFIG_PATH_MFX_UNIX/\/lib\/pkgconfig/$BIT\/lib\/pkgconfig}
-  export PKG_CONFIG_PATH_MFX=$PKG_CONFIG_PATH_MFX_UNIX
-  [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] && export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$PKG_CONFIG_PATH_MFX_UNIX"
+  PKG_CONFIG_PATH_MFX=$PKG_CONFIG_PATH_MFX_UNIX
+  [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] && PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$PKG_CONFIG_PATH_MFX_UNIX"
 
   enable_libmfx
   enable_opt dxva2
+  enable_opt mediafoundation
   disable_opt iconv
   EXTRA_LDFLAGS+=" -static-libgcc -Wl,-Bstatic"
   INSTALL_DIR="${INSTALL_DIR}-mingw-$1-gcc"
@@ -687,9 +734,6 @@ export PATH=$MINGW_BIN:$PATH
 shopt -s expand_aliases
 #alias ${arch}-w64-mingw32-strip=$MINGW_BIN/strip # seems not work in sh used by ffmpeg
 #alias ${arch}-w64-mingw32-nm=$MINGW_BIN/nm
-EOF
-  [ -d "$PKG_CONFIG_PATH_MFX_UNIX" ] && cat >> "$THIS_DIR/build_$INSTALL_DIR/.env.sh" <<EOF
-export PKG_CONFIG_PATH=$PKG_CONFIG_PATH
 EOF
 }
 
@@ -755,7 +799,7 @@ setup_android_env() {
 : '
 -mthumb error
 selected processor does not support Thumb mode `itt gt
-D:\msys2\tmp\ccXOcbBA.s:262: Error: instruction not supported in Thumb16 mode -- adds r3,r1,r0,lsr#31 
+D:\msys2\tmp\ccXOcbBA.s:262: Error: instruction not supported in Thumb16 mode -- adds r3,r1,r0,lsr#31
 use armv6t2 or -mthumb-interwork: https://gcc.gnu.org/onlinedocs/gcc-4.5.3/gcc/ARM-Options.html
 '
 # -msoft-float == -mfloat-abi=soft https://gcc.gnu.org/onlinedocs/gcc-4.5.3/gcc/ARM-Options.html
@@ -864,14 +908,21 @@ EOF
 setup_ios_env() {
   ENC_OPT=$ENC_OPT_MOBILE
   MUX_OPT=$MUX_OPT_MOBILE
-  enable_opt videotoolbox
-  LIB_OPT= #static only
+  enable_opt videotoolbox libxml2
+  disable_opt avdevice
+  EXTRA_CFLAGS+=" -iwithsysroot /usr/include/libxml2"
+  grep -q install-name-dir $FFSRC/configure && TOOLCHAIN_OPT+=" --install_name_dir=@rpath"
+  #LIB_OPT= #static only
 # clang -arch i386 -arch x86_64
 ## cc="xcrun -sdk iphoneos clang" or cc=`xcrun -sdk iphoneos --find clang`
   local IOS_ARCH=$1
   local cc_has_bitcode=false # bitcode since xcode 7
   clang -fembed-bitcode -E - </dev/null &>/dev/null && cc_has_bitcode=true
   : ${BITCODE:=true}
+  : ${TARGET_IOS5:=false}
+  ios_ver=${2##ios}
+  ios_ver=${ios_ver/simulator/}
+  [ -n "$ios_ver" ] && compare_version $ios_ver "<" 6.0 && TARGET_IOS5=true
   local enable_bitcode=false
   $BITCODE && $cc_has_bitcode && enable_bitcode=true
   # bitcode link requires iOS>=6.0. Creating static lib is fine. So compiling with bitcode for <5.0 is fine. but ffmpeg config tests fails to create exe(ios10 sdk, no crt1.3.1.o), so 6.0 is required
@@ -883,19 +934,20 @@ setup_ios_env() {
   local BITCODE_FLAGS=
   local ios5_lib_dir=
   if [ "${IOS_ARCH:0:3}" == "arm" ]; then
-    $enable_bitcode && BITCODE_FLAGS="-fembed-bitcode"
+    $enable_bitcode && BITCODE_FLAGS="-fembed-bitcode" # also works for new sdks
+    BITCODE_LFLAGS=$BITCODE_FLAGS
     if [ "${IOS_ARCH:3:2}" == "64" ]; then
       ios_min=7.0
     else
       TOOLCHAIN_OPT+=" --disable-thumb"
       # armv7 since 3.2, but ios10 sdk does not have crt1.o/crt1.3.1.o, use 6.0 is ok. but we add these files in tools/lib/ios5, so 5.0 and older is fine
       local sdk_crt1_o=`xcrun --show-sdk-path --sdk iphoneos`/usr/lib/crt1.o
-      if [ -f $sdk_crt1_o -o -f $THIS_DIR/tools/lib/ios5/crt1.o ]; then
+      $TARGET_IOS5 && [ -f $sdk_crt1_o -o -f $THIS_DIR/tools/lib/ios5/crt1.o ] && {
         [ -f $sdk_crt1_o ] || ios5_lib_dir=$THIS_DIR/tools/lib/ios5
         ios_min=5.0
-      else
+      } || {
         ios_min=6.0
-      fi
+      }
       sed -i $sed_bak '/^_swri_oldapi_conv_fltp_to_s16_2ch_neon:$/d;/^_swri_oldapi_conv_flt_to_s16_neon:$/d' "$FFSRC/libswresample/arm/audio_convert_neon.S" # breaks armv7 since ffmpeg b22db4f4. restore after build/kill?
     fi
   else
@@ -906,13 +958,14 @@ setup_ios_env() {
     elif [ "${IOS_ARCH}" == "x86" ]; then
       IOS_ARCH=i386
     fi
+    # TOOLCHAIN_OPT+=" --disable-asm" # if bitcode
   fi
-  ios_ver=${2##ios}
   : ${ios_ver:=$ios_min}
+  version_compare $ios_ver "<" 6.0 && BITCODE_LFLAGS=  ##No bitcode flags for iOS < 6.0. we always build static libs. but config test will try to create exe
   TOOLCHAIN_OPT+=" --enable-cross-compile --arch=$IOS_ARCH --target-os=darwin --cc=clang --sysroot=\$(xcrun --sdk $SYSROOT_SDK --show-sdk-path)"
   disable_opt programs
   EXTRA_CFLAGS+=" -arch $IOS_ARCH -m${VER_OS}-version-min=$ios_ver $BITCODE_FLAGS" # -fvisibility=hidden -fvisibility-inlines-hidden"
-  EXTRA_LDFLAGS+=" -arch $IOS_ARCH -m${VER_OS}-version-min=$ios_ver -Wl,-dead_strip" # -fvisibility=hidden -fvisibility-inlines-hidden" #No bitcode flags for iOS < 6.0. we always build static libs. but config test will try to create exe
+  EXTRA_LDFLAGS+=" -arch $IOS_ARCH -m${VER_OS}-version-min=$ios_ver $BITCODE_LFLAGS -Wl,-dead_strip" # -fvisibility=hidden -fvisibility-inlines-hidden"
   if $FFGIT; then
     patch_clock_gettime=1
     [ -d $FFSRC/ffbuild ] && patch_clock_gettime=0 # since 3.3
@@ -922,7 +975,6 @@ setup_ios_env() {
   INSTALL_DIR=sdk-ios-$IOS_ARCH
   mkdir -p $THIS_DIR/build_$INSTALL_DIR
   [ -n "$ios5_lib_dir" ] && echo "export LIBRARY_PATH=$ios5_lib_dir" >$THIS_DIR/build_$INSTALL_DIR/.env.sh
-  sed -i $sed_bak '/check_cflags -Werror=partial-availability/d' "$FFSRC/configure" # for SSL, VT
 }
 
 setup_macos_env(){
@@ -939,9 +991,12 @@ setup_macos_env(){
       MACOS_VER=${2##macos}
       MACOS_VER=${MACOS_VER##osx}
     }
+    TOOLCHAIN_OPT+=" --enable-cross-compile --arch=$MACOS_ARCH  --target-os=darwin"
   fi
   : ${MACOS_VER:=10.7}
-  enable_opt videotoolbox vda
+  [[ "$MACOS_ARCH" == arm64* ]] && version_compare $MACOS_VER "<" 11.0 && MACOS_VER=11.0
+  enable_opt videotoolbox vda libxml2
+  EXTRA_CFLAGS+=" -iwithsysroot /usr/include/libxml2"
   version_compare $MACOS_VER "<" 10.7 && disable_opt lzma avdevice #avfoundation is not supported on 10.6
   grep -q install-name-dir $FFSRC/configure && TOOLCHAIN_OPT+=" --install_name_dir=@rpath"
   if $FFGIT; then
@@ -965,7 +1020,7 @@ setup_macos_env(){
   $IS_APPLE_CLANG || $LD_IS_LLD || {
     TOOLCHAIN_OPT+=" --sysroot=\$(xcrun --sdk macosx --show-sdk-path)"
   }
-  local rpath_dirs=(@loader_path @loader_path/../Frameworks @loader_path/lib @loader_path/../lib)
+  local rpath_dirs=(@loader_path @executable_path/../Frameworks @loader_path/Libraries @loader_path/../lib)
   local rpath_flags=
   [ -n "$LFLAG_PRE" ] && {
     rpath_flags=${rpath_dirs[@]/#/${LFLAG_PRE}-rpath,}
@@ -976,7 +1031,40 @@ setup_macos_env(){
   EXTRA_CFLAGS+=" $ARCH_FLAG -mmacosx-version-min=$MACOS_VER"
   EXTRA_LDFLAGS+=" $ARCH_FLAG $LFLAG_VERSION_MIN$MACOS_VER ${LFLAG_PRE}-dead_strip $rpath_flags"
   INSTALL_DIR=sdk-macOS${MACOS_VER}${MACOS_ARCH}-${USE_TOOLCHAIN##*/}
-  sed -i $sed_bak '/check_cflags -Werror=partial-availability/d' "$FFSRC/configure" # for SSL, VT
+}
+
+setup_maccatalyst_env(){
+  enable_opt videotoolbox libxml2
+  disable_opt avdevice appkit securetransport
+  EXTRA_CFLAGS+=" -iwithsysroot /usr/include/libxml2"
+  grep -q install-name-dir $FFSRC/configure && TOOLCHAIN_OPT+=" --install_name_dir=@rpath"
+  local IOS_ARCH=$1
+  local cc_has_bitcode=false # bitcode since xcode 7
+  clang -fembed-bitcode -E - </dev/null &>/dev/null && cc_has_bitcode=true
+  : ${BITCODE:=true}
+  ios_ver=${2##*catalyst}
+  local enable_bitcode=false
+  $BITCODE && $cc_has_bitcode && enable_bitcode=true
+  $enable_bitcode && echo "Bitcode is enabled by default. set 'BITCODE=false' to disable"
+# http://iossupportmatrix.com
+  local ios_min=13.0
+  local SYSROOT_SDK=macosx
+  local VER_OS=iphoneos
+  local BITCODE_FLAGS=
+  $enable_bitcode && BITCODE_FLAGS="-fembed-bitcode" # also works for new sdks
+  BITCODE_LFLAGS=$BITCODE_FLAGS
+  : ${ios_ver:=$ios_min}
+  # x86 asm: https://stackoverflow.com/questions/58796267/building-for-macos-but-linking-in-object-file-built-for-free-standing/59103419#59103419
+  [[ "$IOS_ARCH" == x*64 || "$IOS_ARCH" == *86* ]] && ASM_OPT="--disable-asm"
+  local rpath_dirs=(@loader_path @executable_path/../Frameworks @loader_path/Libraries @loader_path/../lib)
+  local rpath_flags=${rpath_dirs[@]/#/-Wl,-rpath,}
+
+  SDK_DIR=$(xcrun --sdk $SYSROOT_SDK --show-sdk-path)
+  TOOLCHAIN_OPT+=" --enable-cross-compile $ASM_OPT --arch=$IOS_ARCH --target-os=darwin --cc=clang --sysroot=\$(xcrun --sdk $SYSROOT_SDK --show-sdk-path)"
+  EXTRA_CFLAGS+=" -target ${IOS_ARCH}-apple-ios-macabi -m${VER_OS}-version-min=$ios_ver $BITCODE_FLAGS -iframework ${SDK_DIR}/System/iOSSupport/System/Library/Frameworks" # -fvisibility=hidden -fvisibility-inlines-hidden"
+  EXTRA_LDFLAGS+=" -target ${IOS_ARCH}-apple-ios-macabi -m${VER_OS}-version-min=$ios_ver $BITCODE_LFLAGS -Wl,-dead_strip $rpath_flags -iframework ${SDK_DIR}/System/iOSSupport/System/Library/Frameworks" # -fvisibility=hidden -fvisibility-inlines-hidden"
+  INSTALL_DIR=sdk-maccatalyst-$IOS_ARCH
+  mkdir -p $THIS_DIR/build_$INSTALL_DIR
 }
 
 # version_compare v1 "op" v2, e.g. version_compare 10.6 "<" 10.7
@@ -1052,10 +1140,11 @@ setup_gnu_env(){
   add_elf_flags
   local gnu_cc=gcc
   local ARCH=${1:0:5}
+  TOOLCHAIN_OPT+=" --toolchain=hardened"
   $IS_CROSS_BUILD && {
     IS_CROSS_BUILD=true
     echo "gnu cross build"
-    TOOLCHAIN_OPT="--toolchain=hardened --enable-cross-compile --target-os=linux --arch=arm"
+    TOOLCHAIN_OPT+=" --enable-cross-compile --target-os=linux --arch=$ARCH"
     which "${CROSS_PREFIX}gcc" && SYSROOT_CC=`${CROSS_PREFIX}gcc -print-sysroot` # TODO: not for clang
   } || {
     echo "gnu host build"
@@ -1066,16 +1155,17 @@ setup_gnu_env(){
     echo "gnu sysroot is not found!"
     exit 1
   }
+  PKG_CONFIG_PATH+=":$SYSROOT/usr/lib/${CROSS_PREFIX%%-}/pkgconfig"
   $IS_CROSS_BUILD && TOOLCHAIN_OPT+=" --sysroot=\\\$SYSROOT" # clang searchs host by default, so sysroot is required
   # probe compiler first
-  setup_cc ${USE_TOOLCHAIN:=gcc} "--target=${CROSS_PREFIX%%-}" # clang on mac(apple or opensource) will use apple flags w/o --target= 
+  setup_cc ${USE_TOOLCHAIN:=gcc} "--target=${CROSS_PREFIX%%-}" # clang on mac(apple or opensource) will use apple flags w/o --target=
 # t.S: x .dn 0
 # gas-preprocessor.pl -arch arm -as-type clang -- clang --target=armv7-none-linux-androideabi -march=armv7-a -mfloat-abi=softfp t.S -v -c
 # clang -fintegrated-as --target=armv7-none-linux-androideabi -march=armv7-a -mfloat-abi=softfp -gcc-toolchain $ANDROID_NDK/toolchains/arm-linux-androideabi-4.9/prebuilt/darwin-x86_64/ t.S -v -c
 # host build can always use binutils, so only cross build uses gas-pp
   local SUBARCH=${ARCH}-a
   local AS_GAS=false
-  $IS_CROSS_BUILD && $IS_CLANG && {
+  $IS_CROSS_BUILD && $IS_CLANG && [[ "$ARCH" == arm* && "$ARCH" != *64 ]] && {
     grep -q as_dn_directive "$FFSRC/configure" || AS_GAS=true
   }
   $AS_GAS && {
@@ -1112,6 +1202,10 @@ setup_gnu_env(){
   #-lrt: clock_gettime in glibc2.17
   EXTRALIBS+=" -lrt"
   INSTALL_DIR=sdk-$2-${ARCH}-${gnu_cc}
+  mkdir -p $THIS_DIR/build_$INSTALL_DIR
+  cat > "$THIS_DIR/build_$INSTALL_DIR/.env.sh" <<EOF
+export PKG_CONFIG_PATH=$PKG_CONFIG_PATH
+EOF
 }
 
 # TODO: generic linux for all archs
@@ -1119,8 +1213,9 @@ setup_linux_env() {
   : ${USE_TOOLCHAIN:=gcc}
   probe_cc $USE_TOOLCHAIN
   add_elf_flags
-  enable_libmfx
   enable_opt vaapi vdpau
+  $IS_CLANG && enable_cuda_llvm
+
   local CC_ARCH=`$USE_TOOLCHAIN -dumpmachine`
   CC_ARCH=${CC_ARCH%%-*}
   local CC_BIT=64
@@ -1128,13 +1223,21 @@ setup_linux_env() {
   local ARCH=$1
   local BIT=64
   [ -z "$ARCH" -o "$ARCH" == "linux" ] && ARCH=$CC_ARCH
+  ARCH=$(linux_arch $ARCH)
+  [[ "$ARCH" == amd64  || "$ARCH" == x*64 ]] && enable_libmfx
+  if [ -n "$SYSROOT" ]; then
+    CROSS_PREFIX=$(linux_gnu_triple $ARCH)-
+    setup_gnu_env $ARCH linux
+    return 0
+  fi
+
+  TOOLCHAIN_OPT+=" --toolchain=hardened"
   [ -n "${ARCH/*64/}" ] && BIT=32
   [ $BIT -ne $CC_BIT ] && {
     EXTRA_CFLAGS="-m$BIT $EXTRA_CFLAGS"
     EXTRA_LDFLAGS="-m$BIT $EXTRA_LDFLAGS"
   }
   $IS_CLANG && {
-    enable_cuda_llvm
     EXTRA_CFLAGS+=" $CFLAGS_CLANG $CLANG_FLAGS"
     EXTRA_LDFLAGS+=" $LFLAGS_CLANG $CLANG_FLAGS"
     $HAVE_LLD && [ $BIT -eq 64 ] && use_lld # 32bit error: can't create dynamic relocation R_386_32 against local symbol in readonly segment   libavutil/x86/float_dsp.o
@@ -1181,6 +1284,7 @@ config1(){
     android*)    setup_android_env $TAGET_ARCH_FLAG $1 ;;
     ios*)       setup_ios_env $TAGET_ARCH_FLAG $1 ;;
     osx*|macos*)     setup_macos_env $TAGET_ARCH_FLAG $1 ;;
+    *catalyst*) setup_maccatalyst_env $TAGET_ARCH_FLAG $1 ;;
     mingw*)     setup_mingw_env $TAGET_ARCH_FLAG ;;
     vc|win*|uwp*)  setup_win $TAGET_ARCH_FLAG $1 ;; # TODO: check cc
     rpi*|raspberry*) setup_rpi_env $TAGET_ARCH_FLAG $1 ;;
@@ -1233,9 +1337,7 @@ config1(){
   is_libav || FEATURE_OPT+=" --enable-avresample --disable-postproc"
   local CONFIGURE="configure --extra-version=QtAV --disable-doc ${DEBUG_OPT} $LIB_OPT --enable-runtime-cpudetect $FEATURE_OPT $TOOLCHAIN_OPT $USER_OPT"
   : ${NO_ENC=false}
-  if ! $NO_ENC && [ -n "$ENC_OPT" ]; then
     CONFIGURE+=" $ENC_OPT $MUX_OPT"
-  fi
   CONFIGURE=`trim2 $CONFIGURE`
   # http://ffmpeg.org/platform.html
   # static: --enable-pic --extra-ldflags="-Wl,-Bsymbolic" --extra-ldexeflags="-pie"
@@ -1253,6 +1355,7 @@ config1(){
   if $reconf; then
     [ -f .env.sh ] && . .env.sh && cat .env.sh
     echo configuration changes
+	rm -f config-utf8.h
     time eval $CONFIGURE
   fi
   if [ $? -eq 0 ]; then
@@ -1295,7 +1398,7 @@ config1(){
 " "$FFSRC_TOOLS/cmdutils.c"
     fi
     if $VC_BUILD; then # check ffmpeg version?
-      if [ "${VisualStudioVersion:0:2}" -gt 14 ] && `echo $LANG |grep -q zh` && [ ! -f config-utf8.h ] ; then  # check ffmpeg version?
+      if [ "${VisualStudioVersion:0:2}" -ge 14 ] && `echo $LANG |grep -q zh` && [ ! -f config-utf8.h ] ; then  # check ffmpeg version?
         iconv -t "UTF-8" -f "GBK" config.h > config-utf8.h
         cp -f config{-utf8,}.h
       fi
@@ -1335,7 +1438,10 @@ incdir=\${prefix}/include
 EOF
   [ -f .env.sh ] && . .env.sh
   ## https://github.com/ninja-build/ninja/pull/1224
-  time (make -j`getconf _NPROCESSORS_ONLN` install prefix="$THIS_DIR/$INSTALL_DIR" && cp -af config.txt $THIS_DIR/$INSTALL_DIR)
+  time (make -j${JOBS:-`getconf _NPROCESSORS_ONLN`} install prefix="$THIS_DIR/$INSTALL_DIR" && {
+      cp -af config.txt $THIS_DIR/$INSTALL_DIR
+      cp -af $FFBUILD/config.log $THIS_DIR/$INSTALL_DIR
+  })
   [ $? -eq 0 ] || exit 2
   $THIS_DIR/tools/mklibffmpeg.sh $PWD $THIS_DIR/$INSTALL_DIR
   cd $THIS_DIR/$INSTALL_DIR
@@ -1357,14 +1463,19 @@ build_all(){
     local archs=($2)
     [ -z "$archs" ] && {
       echo ">>>>>no arch is set. setting default archs..."
-      [ "${os:0:3}" == "ios" ] && archs=(armv7 arm64 x86 x86_64)
+      [ "${os:0:3}" == "ios" ] && {
+        echo $os | grep simulator >/dev/null && archs=(x86 x86_64) || archs=(armv7 arm64)
+      }
       [ "${os:0:7}" == "android" ] && archs=(armv7 arm64 x86 x86_64)
       [ "${os:0:3}" == "rpi" -o "${os:0:9}" == "raspberry" ] && archs=(armv6zk armv7-a)
       [[ "$os" == "sunxi" ]] && archs=(armv7)
       [ "${os:0:5}" == "mingw" ] && archs=(x86 x86_64)
       [ "${os:0:2}" == "vc" -o "${os:0:3}" == "win" ] && archs=(x86 x64 arm arm64)
       [[ "${os:0:5}" == "winrt" || "${os:0:3}" == "uwp" || "$os" == win*store* || "$os" == win*phone* ]] && archs=(x86 x64 arm arm64)
-      #[ "${os:0:5}" == "macos" ] && archs=(x86_64 i386)
+      [[ "$os" == macos* || "$os" == *catalyst* ]] && {
+        archs=
+        echo "#include <stdint.h> " |clang -arch arm64 -isysroot $(xcrun --sdk macosx --show-sdk-path) -x c -c - 2>/dev/null && archs=(x86_64 arm64)
+      }
     }
     echo ">>>>>archs: ${archs[@]}"
     [ -z "$archs" ] && {
@@ -1421,11 +1532,12 @@ make_universal()
   local dirs=($2)
   [ -z "$dirs" ] && return 0
   [ ${#dirs[@]} -le 1 ] && return 0
-  if [ "${os:0:3}" == ios ]; then
+# TODO: move to a new script
+  if [[ "$os" == ios* || "$os" == macos* || "$os" == osx* || "$os" == *catalyst* ]]; then
     local OUT_DIR=sdk-$os
     rm -rf $OUT_DIR
     cd $THIS_DIR
-    mkdir -p $OUT_DIR/lib
+    mkdir -p $OUT_DIR/{bin,lib}
     cp -af ${dirs[0]}/include $OUT_DIR
     for a in libavutil libavformat libavcodec libavfilter libavresample libavdevice libswscale libswresample; do
       libs=
@@ -1438,7 +1550,36 @@ make_universal()
         lipo -info $OUT_DIR/lib/${a}.a
       }
     done
-    cat build_sdk-${os}-*/config.txt >$OUT_DIR/config.txt
+    for a in libavutil libavformat libavcodec libavfilter libavresample libavdevice libswscale libswresample libffmpeg; do
+      dylibs=
+      for d in ${dirs[@]}; do
+        dylib=$(ls $d/lib/${a}.*.*.dylib)
+        [ -n "$dylib" ] || dylib=$(ls $d/lib/${a}.*.dylib) # libffmpeg.4.dylib
+        dylib=${dylib##*/}
+        [ -f $d/lib/$dylib ] && dylibs+=" $d/lib/$dylib"
+      done
+      cp -af $d/lib/${a}.*.dylib $d/lib/${a}.dylib $OUT_DIR/lib/
+      #echo "lipo -create $dylibs -o $OUT_DIR/lib/$dylib"
+      test -n "$dylibs" && {
+        lipo -create $dylibs -o $OUT_DIR/lib/$dylib
+        lipo -info $OUT_DIR/lib/$dylib
+      }
+    done
+    for b in ffmpeg ffplay ffprobe; do
+      bins=
+      for d in ${dirs[@]}; do
+        [ -f "$d/bin/$b" ] && bins+=" $d/bin/$b"
+      done
+      #echo "lipo -create $bins -o $OUT_DIR/bin/$b"
+      test -n "$bins" && {
+        lipo -create $bins -o $OUT_DIR/bin/$b
+        lipo -info $OUT_DIR/bin/$b
+      }
+    done
+    for d in ${dirs[@]}; do
+      cat $d/config.txt >>$OUT_DIR/config.txt
+    done
+  # TODO: create tbd
     cp -af $FFSRC/{Changelog,RELEASE_NOTES} $OUT_DIR
     [ -f "$FFSRC/$LICENSE_FILE" ] && cp -af "$FFSRC/$LICENSE_FILE" $OUT_DIR || touch $OUT_DIR/$LICENSE_FILE
     echo "https://github.com/wang-bin/avbuild" >$OUT_DIR/README.txt
@@ -1461,6 +1602,7 @@ make_universal()
       cp -af $d/bin/* $OUT_DIR/bin/$arch
       cp -af $d/lib/* $OUT_DIR/lib/$arch
       cat $d/config.txt >$OUT_DIR/config-$arch.txt
+      cat $d/config.log >$OUT_DIR/config-$arch.log
       cp -af $FFSRC/{Changelog,RELEASE_NOTES} $OUT_DIR
       [ -f "$FFSRC/$LICENSE_FILE" ] && cp -af "$FFSRC/$LICENSE_FILE" $OUT_DIR || touch $OUT_DIR/$LICENSE_FILE
       echo "https://github.com/wang-bin/avbuild" >$OUT_DIR/README.txt

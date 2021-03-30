@@ -25,7 +25,7 @@ jobs:
       export FFSRC=$PWD/ffmpeg-${FF_VERSION}
       export WindowsSdkDir=${WINDOWSSDKDIR}
       export WindowsSDKVersion=$(cat ${WINDOWSSDKDIR}/.version)
-      USE_TOOLCHAIN=clang-${LLVM_VER:-10} ./avbuild.sh $TARGET_OS "arm64-clang-cl-${LLVM_VER:-10} x86 x64"
+      USE_TOOLCHAIN=clang-${LLVM_VER:-12} ./avbuild.sh $TARGET_OS "arm64-clang-cl-${LLVM_VER:-12} x86 x64"
     displayName: 'Build'
   - bash: ./tools/ci-after-build.sh
     env:
@@ -38,20 +38,42 @@ jobs:
   pool:
     vmImage: 'ubuntu-18.04'
   variables:
-    TARGET_OS: windows-store
+    TARGET_OS: uwp
     VCDIR: '/tmp/msvcrt-dev'
     WINDOWSSDKDIR: '/tmp/winsdk' # always convet to upper case
     COMPILER: 'clang'
   steps:
   - bash: |
       ./tools/ci-before-build.sh
-      sudo apt install -y lld-8 clang-tools-8
     displayName: 'Install Dev Tools and Dependencies'
   - bash: |
       export FFSRC=$PWD/ffmpeg-${FF_VERSION}
       export WindowsSdkDir=${WINDOWSSDKDIR}
       export WindowsSDKVersion=$(cat ${WINDOWSSDKDIR}/.version)
-      USE_TOOLCHAIN=clang-${LLVM_VER:-10} ./avbuild.sh ${TARGET_OS} "arm64-clang-cl-${LLVM_VER:-10} arm-clang-8 x86 x64"
+      USE_TOOLCHAIN=clang-${LLVM_VER:-12} ./avbuild.sh ${TARGET_OS} "arm64-clang-cl-${LLVM_VER:-12} arm x86 x64"
+    displayName: 'Build'
+  - bash: ./tools/ci-after-build.sh
+    env:
+      SF_USER_MAPPED: $(SF_USER)
+      SF_PW_MAPPED: $(SF_PW)
+    displayName: 'Make SDK'
+
+- job: 'VCRT120_clang'
+  pool:
+    vmImage: 'ubuntu-18.04'
+  variables:
+    TARGET_OS: windows-desktop
+    VCDIR: '/tmp/msvcrt-dev/120'
+    WINDOWSSDKDIR: '/tmp/winsdk'
+    COMPILER: 'clang-vcrt120'
+  steps:
+  - script: ./tools/ci-before-build.sh
+    displayName: 'Install Dev Tools and Dependencies'
+  - bash: |
+      export FFSRC=$PWD/ffmpeg-${FF_VERSION}
+      export WindowsSdkDir=${WINDOWSSDKDIR}
+      export WindowsSDKVersion=$(cat ${WINDOWSSDKDIR}/.version)
+      USE_TOOLCHAIN=clang-${LLVM_VER:-12} ./avbuild.sh $TARGET_OS "x86 x64"
     displayName: 'Build'
   - bash: ./tools/ci-after-build.sh
     env:
@@ -91,7 +113,8 @@ jobs:
     displayName: 'Install Dev Tools and Dependencies'
   - bash: |
       export FFSRC=$PWD/ffmpeg-${FF_VERSION}
-      USE_TOOLCHAIN=clang-${LLVM_VER:-10} ./avbuild.sh
+      export SYSROOT=/tmp/sysroot
+      USE_TOOLCHAIN=clang-${LLVM_VER:-12} ./avbuild.sh linux "amd64 arm64 armhf"
     displayName: 'Build'
   - bash: ./tools/ci-after-build.sh
     env:
@@ -112,7 +135,7 @@ jobs:
   - bash: |
       export FFSRC=$PWD/ffmpeg-${FF_VERSION}
       export SYSROOT=/tmp/sysroot
-      USE_TOOLCHAIN=clang-${LLVM_VER:-10} ./avbuild.sh ${TARGET_OS}
+      USE_TOOLCHAIN=clang-${LLVM_VER:-12} ./avbuild.sh ${TARGET_OS}
     displayName: 'Build'
   - bash: ./tools/ci-after-build.sh
     env:
@@ -132,7 +155,7 @@ jobs:
   - bash: |
       export FFSRC=$PWD/ffmpeg-${FF_VERSION}
       export SYSROOT=/tmp/sysroot
-      USE_TOOLCHAIN=clang-${LLVM_VER:-10} ./avbuild.sh ${TARGET_OS}
+      USE_TOOLCHAIN=clang-${LLVM_VER:-12} ./avbuild.sh ${TARGET_OS}
     displayName: 'Build'
   - bash: ./tools/ci-after-build.sh
     env:
@@ -146,12 +169,12 @@ jobs:
     vmImage: 'macOS-latest'
   variables:
     TARGET_OS: android
-    ANDROID_NDK: /tmp/android-ndk
   steps:
   - script: ./tools/ci-before-build.sh
     displayName: 'Install Dev Tools and Dependencies'
 
   - bash: |
+      export ANDROID_NDK=$ANDROID_NDK_LATEST_HOME
       export FFSRC=$PWD/ffmpeg-${FF_VERSION}
       ./avbuild.sh ${TARGET_OS}
     displayName: 'Build'
